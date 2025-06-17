@@ -1,0 +1,941 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Your Fitness Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, collection, addDoc, query, getDocs, where } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Chosen Palette: Clean Neutrals & Rich Teal (Improved Contrast)
+        // Application Structure Plan: A single-page dashboard provides an at-a-glance overview. The structure includes: 1) A top-level summary of key metrics (Calories, Macros) for immediate goal reinforcement. 2) A tabbed navigation system ("Dashboard", "Workout Plan", "Principles") to logically segment the detailed information. This is more user-friendly than a long document, allowing users to quickly access their daily workout or review nutritional goals. The "Workout Plan" now includes a month selector for progressive plans and uses day-specific buttons to reveal routines, preventing information overload. The "Meal Idea Generator" is integrated into the Dashboard tab for dynamic nutrition suggestions. A new "Workout History" section within the Principles tab allows tracking of logged workout days, reinforcing accountability, now visually enhanced with a calendar. This interactive, task-oriented structure with clear navigation is superior for daily use and long-term progress tracking compared to a static report.
+        // Visualization & Content Choices: 
+        //     - Report Info: Calorie & Macro targets (Protein, Carbs, Fats). Goal: Inform & show proportions. Viz/Method: A doughnut chart (Chart.js) on the main dashboard visualizes the caloric split of macros. Interaction: Hovering reveals calorie details. Justification: A chart provides a much faster, more intuitive understanding of dietary balance than text alone.
+        //     - Report Info: Full weekly workout schedule (Month 1 & 2). Goal: Organize & guide daily tasks. Viz/Method: Interactive buttons for each workout day (HTML/CSS/JS) and a month selector. Interaction: Clicking a month/day button displays that specific routine, hiding others. Justification: This focuses the user on a single day's workout or specific month's plan, making the plan feel manageable and easy to follow at the gym, supporting progressive overload.
+        //     - Report Info: Core principles for success. Goal: Inform & reinforce key habits. Viz/Method: A grid of cards with icons (HTML/Tailwind). Interaction: Static display. Justification: The card layout breaks up text, making the principles more scannable and memorable than a simple list.
+        //     - Report Info: Meal Idea Generation. Goal: Provide dynamic, personalized nutrition guidance. Viz/Method: Text input for meal type, a button to trigger LLM call, and a text display area for the generated meal idea (HTML/CSS/JS). Interaction: User enters meal type, clicks button, LLM provides a recipe/idea based on set calorie/macro goals. Justification: Leverages generative AI to provide practical, on-demand meal suggestions, directly assisting the user with their nutrition goals, which is a critical component of their fitness plan.
+        //     - Report Info: Workout Tracking. Goal: Monitor consistency. Viz/Method: "Mark as Complete" buttons on daily workouts, a list of logged workouts, and an interactive calendar (HTML/CSS/JS + Firebase). Interaction: User clicks button to log; history view displays logged dates and workout types; calendar visually marks logged days and allows month navigation. Justification: Provides a tangible, visual way for users to track adherence and see their progress over time, enhancing motivation and accountability.
+        // CONFIRMATION: NO SVG graphics used. NO Mermaid JS used.
+
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        let app, db, auth, userId;
+        let loggedWorkoutsGlobal = []; // To store fetched workouts globally
+
+        let currentCalendarDate = new Date(); // State for calendar month/year
+
+        // Make functions globally accessible for inline onclick attributes
+        window.showTab = function(tabName) {
+            const contentSections = document.querySelectorAll('.content-section');
+            contentSections.forEach(section => {
+                section.classList.remove('active');
+            });
+            document.getElementById(tabName).classList.add('active');
+
+            const tabButtons = document.querySelectorAll('.tab-btn');
+            tabButtons.forEach(button => {
+                button.classList.remove('active-tab');
+            });
+            document.querySelector(`button[onclick="showTab('${tabName}')"]`).classList.add('active-tab');
+            
+            if (tabName === 'principles') {
+                displayWorkoutHistory(); // Refresh history when principles tab is shown
+                renderCalendar(currentCalendarDate.getFullYear(), currentCalendarDate.getMonth()); // Render calendar for current month
+            }
+        }
+
+        window.showMonth = function(month) {
+            const monthPlans = document.querySelectorAll('.month-plan');
+            monthPlans.forEach(plan => {
+                plan.style.display = 'none';
+            });
+            document.getElementById(`${month}-plan`).style.display = 'block';
+
+            const monthSelectors = document.querySelectorAll('.month-selector');
+            monthSelectors.forEach(selector => {
+                selector.classList.remove('active');
+            });
+            document.querySelector(`button[data-month="${month}"]`).classList.add('active');
+
+            // Reset to Monday workout for the selected month
+            const defaultWorkoutDay = document.querySelector(`#${month}-plan .workout-day-btn`).dataset.day;
+            showWorkout(defaultWorkoutDay, month);
+        }
+
+        window.showWorkout = function(day, month = null) {
+            // Determine current active month if not explicitly passed
+            const currentMonth = month || document.querySelector('.month-selector.active')?.dataset.month || 'month1';
+
+            const workoutPlans = document.querySelectorAll('.workout-plan');
+            workoutPlans.forEach(plan => {
+                plan.style.display = 'none';
+                plan.classList.remove('active');
+            });
+            
+            const targetWorkoutId = `${day}-workout-${currentMonth}`;
+            const targetWorkoutElement = document.getElementById(targetWorkoutId);
+            if (targetWorkoutElement) {
+                targetWorkoutElement.style.display = 'block';
+                targetWorkoutElement.classList.add('active');
+            }
+
+            const dayButtons = document.querySelectorAll(`#${currentMonth}-plan .workout-day-btn`);
+            dayButtons.forEach(button => {
+                button.classList.remove('active');
+            });
+            const selectedDayButton = document.querySelector(`#${currentMonth}-plan .workout-day-btn[data-day="${day}"]`);
+            if (selectedDayButton) {
+                selectedDayButton.classList.add('active');
+            }
+
+            updateLogButtons(); // Update state of log buttons after changing workout view
+        }
+
+        window.logWorkout = async function(buttonElement) {
+            if (!db || !userId) {
+                alert("Workout tracking is not available. Please check Firebase configuration.");
+                return;
+            }
+
+            const workoutDayId = buttonElement.dataset.workoutDayId;
+            const monthPlan = buttonElement.dataset.monthPlan;
+            const today = new Date();
+            const dateString = today.toISOString().split('T')[0]; // Format YYYY-MM-DD for uniqueness
+
+            try {
+                // Check if already logged for today for this specific workout
+                const q = query(
+                    collection(db, `artifacts/${appId}/users/${userId}/workout_logs`),
+                    where("date", "==", dateString),
+                    where("workoutDayId", "==", workoutDayId),
+                    where("monthPlan", "==", monthPlan)
+                );
+                const querySnapshot = await getDocs(q);
+
+                if (querySnapshot.empty) {
+                    await addDoc(collection(db, `artifacts/${appId}/users/${userId}/workout_logs`), {
+                        date: dateString,
+                        timestamp: new Date(),
+                        workoutDayId: workoutDayId,
+                        monthPlan: monthPlan
+                    });
+                    console.log("Workout logged successfully!");
+                    displayWorkoutHistory(); // Refresh history (which also updates buttons and calendar)
+                    buttonElement.textContent = 'Logged Today ✅';
+                    buttonElement.classList.add('bg-gray-400', 'hover:bg-gray-400');
+                    buttonElement.classList.remove('bg-[#007B7A]', 'hover:bg-[#005C5B]');
+                    buttonElement.disabled = true;
+
+                } else {
+                    alert("This specific workout has already been logged for today!");
+                    buttonElement.disabled = true;
+                    buttonElement.textContent = 'Logged Today ✅';
+                    buttonElement.classList.add('bg-gray-400', 'hover:bg-gray-400');
+                    buttonElement.classList.remove('bg-[#007B7A]', 'hover:bg-[#005C5B]');
+                }
+            } catch (e) {
+                console.error("Error logging workout: ", e);
+                alert("Error logging workout: " + e.message);
+            }
+        }
+
+        window.displayWorkoutHistory = async function() {
+            if (!db || !userId) {
+                document.getElementById('workoutHistoryList').innerHTML = '<li>Workout tracking is unavailable.</li>';
+                document.getElementById('totalWorkoutsCount').textContent = '0';
+                return;
+            }
+            const workoutHistoryContainer = document.getElementById('workoutHistoryList');
+            const totalWorkoutsSpan = document.getElementById('totalWorkoutsCount');
+            
+            workoutHistoryContainer.innerHTML = '<li>Loading history...</li>';
+            totalWorkoutsSpan.textContent = '...';
+            loggedWorkoutsGlobal = []; // Clear global array before fetching
+
+            try {
+                const q = query(
+                    collection(db, `artifacts/${appId}/users/${userId}/workout_logs`)
+                );
+                const querySnapshot = await getDocs(q);
+
+                querySnapshot.forEach((doc) => {
+                    const data = doc.data();
+                    loggedWorkoutsGlobal.push(data);
+                });
+
+                // Sort by timestamp descending
+                loggedWorkoutsGlobal.sort((a, b) => b.timestamp.toDate() - a.timestamp.toDate());
+
+                workoutHistoryContainer.innerHTML = '';
+                if (loggedWorkoutsGlobal.length === 0) {
+                    workoutHistoryContainer.innerHTML = '<li>No workouts logged yet.</li>';
+                } else {
+                    let uniqueDates = new Set();
+                    loggedWorkoutsGlobal.forEach(log => {
+                        const date = new Date(log.timestamp.toDate()).toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' });
+                        const workoutNameMap = {
+                            'monday-workout-month1': 'Upper Body A (M1)',
+                            'tuesday-workout-month1': 'Lower Body A + Abs (M1)',
+                            'thursday-workout-month1': 'Upper Body B (M1)',
+                            'friday-workout-month1': 'Lower Body B + Abs (M1)',
+                            'monday-workout-month2': 'Chest + Triceps (M2)',
+                            'tuesday-workout-month2': 'Back + Biceps (M2)',
+                            'thursday-workout-month2': 'Shoulders + Abs (M2)',
+                            'friday-workout-month2': 'Legs + Calves (M2)'
+                        };
+                        const displayWorkoutName = workoutNameMap[log.workoutDayId] || log.workoutDayId.replace('-', ' ');
+                        
+                        const listItem = document.createElement('li');
+                        listItem.className = 'py-2 border-b border-gray-100 last:border-b-0';
+                        listItem.innerHTML = `<span class="font-semibold text-gray-800">${date}:</span> <span class="capitalize">${displayWorkoutName}</span>`;
+                        workoutHistoryContainer.appendChild(listItem);
+                        uniqueDates.add(log.date); // Add original date string to count unique days
+                    });
+                    totalWorkoutsSpan.textContent = uniqueDates.size;
+                }
+                updateLogButtons(); // Update buttons after history is loaded
+                renderCalendar(currentCalendarDate.getFullYear(), currentCalendarDate.getMonth()); // Re-render calendar
+            } catch (e) {
+                console.error("Error fetching workout history: ", e);
+                workoutHistoryContainer.innerHTML = '<li>Error loading history.</li>';
+                totalWorkoutsSpan.textContent = 'N/A';
+            }
+        }
+
+        window.updateLogButtons = function() {
+            const todayDateString = new Date().toISOString().split('T')[0]; // Format YYYY-MM-DD
+            const logButtons = document.querySelectorAll('.log-workout-btn');
+
+            logButtons.forEach(button => {
+                const buttonWorkoutDayId = button.dataset.workoutDayId;
+                const buttonMonthPlan = button.dataset.monthPlan;
+                
+                const isLoggedForToday = loggedWorkoutsGlobal.some(log => 
+                    log.date === todayDateString && 
+                    log.workoutDayId === buttonWorkoutDayId && 
+                    log.monthPlan === buttonMonthPlan
+                );
+                
+                // Only update visible button for active workout plan
+                const parentWorkoutPlan = button.closest('.workout-plan');
+                if (parentWorkoutPlan && parentWorkoutPlan.classList.contains('active')) {
+                    if (isLoggedForToday) {
+                        button.disabled = true;
+                        button.textContent = 'Logged Today ✅';
+                        button.classList.add('bg-gray-400', 'hover:bg-gray-400');
+                        button.classList.remove('bg-[#007B7A]', 'hover:bg-[#005C5B]');
+                    } else {
+                        button.disabled = false;
+                        button.textContent = 'Mark as Complete';
+                        button.classList.remove('bg-gray-400', 'hover:bg-gray-400');
+                        button.classList.add('bg-[#007B7A]', 'hover:bg-[#005C5B]');
+                    }
+                } else {
+                     // For non-active workout plans, ensure buttons are reset/enabled
+                    button.disabled = false;
+                    button.textContent = 'Mark as Complete';
+                    button.classList.remove('bg-gray-400', 'hover:bg-gray-400');
+                    button.classList.add('bg-[#007B7A]', 'hover:bg-[#005C5B]');
+                }
+            });
+        }
+
+        // Calendar Functions
+        window.renderCalendar = function(year, month) {
+            const monthNames = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+            const calendarDaysContainer = document.getElementById('calendarDays');
+            const currentMonthDisplay = document.getElementById('currentMonthDisplay');
+
+            currentMonthDisplay.textContent = `${monthNames[month]} ${year}`;
+            calendarDaysContainer.innerHTML = '';
+
+            const firstDayOfMonth = new Date(year, month, 1).getDay(); // 0 for Sunday, 1 for Monday...
+            const daysInMonth = new Date(year, month + 1, 0).getDate();
+
+            // Adjust first day of month to start from Monday (0 for Monday, 6 for Sunday)
+            const startDayIndex = (firstDayOfMonth === 0) ? 6 : firstDayOfMonth - 1; 
+
+            // Fill leading empty days
+            for (let i = 0; i < startDayIndex; i++) {
+                const emptyDay = document.createElement('div');
+                emptyDay.className = 'p-2 text-center text-gray-400';
+                calendarDaysContainer.appendChild(emptyDay);
+            }
+
+            // Fill days of the month
+            const today = new Date();
+            const todayDateString = today.toISOString().split('T')[0]; // YYYY-MM-DD format
+
+            for (let day = 1; day <= daysInMonth; day++) {
+                const dayElement = document.createElement('div');
+                let dateToCheck = `${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+                
+                dayElement.className = 'p-2 text-center rounded-lg relative';
+                dayElement.textContent = day;
+
+                if (dateToCheck === todayDateString) {
+                    dayElement.classList.add('bg-blue-100', 'font-bold', 'text-blue-700'); // Highlight today
+                }
+
+                // Check if workout was logged on this day
+                const hasWorkout = loggedWorkoutsGlobal.some(log => log.date === dateToCheck);
+                if (hasWorkout) {
+                    dayElement.classList.add('bg-[#D4E7E6]', 'text-[#007B7A]', 'font-bold'); // Teal for logged day
+                    const checkMark = document.createElement('span');
+                    checkMark.textContent = '✅';
+                    checkMark.className = 'absolute top-0 right-0 text-xs'; // Small checkmark
+                    dayElement.appendChild(checkMark);
+                }
+                
+                calendarDaysContainer.appendChild(dayElement);
+            }
+        }
+
+        window.changeMonth = function(direction) {
+            currentCalendarDate.setMonth(currentCalendarDate.getMonth() + direction);
+            renderCalendar(currentCalendarDate.getFullYear(), currentCalendarDate.getMonth());
+        }
+
+
+        document.addEventListener('DOMContentLoaded', async () => {
+            // Firebase Initialization
+            if (Object.keys(firebaseConfig).length > 0) {
+                app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+
+                try {
+                    if (initialAuthToken) {
+                        await signInWithCustomToken(auth, initialAuthToken);
+                    } else {
+                        await signInAnonymously(auth);
+                    }
+                    userId = auth.currentUser?.uid || crypto.randomUUID();
+                    console.log("Firebase initialized and user authenticated:", userId);
+                    displayWorkoutHistory(); // Load history on startup and render calendar
+                } catch (e) {
+                    console.error("Error initializing Firebase or authenticating: ", e);
+                    document.querySelectorAll('.log-workout-btn').forEach(btn => btn.disabled = true);
+                    document.getElementById('workoutHistoryList').innerHTML = '<li>Error loading workout history.</li>';
+                    renderCalendar(currentCalendarDate.getFullYear(), currentCalendarDate.getMonth()); // Render calendar even if no data
+                }
+            } else {
+                console.warn("Firebase config not found. Workout tracking will not be available.");
+                document.querySelectorAll('.log-workout-btn').forEach(btn => btn.disabled = true);
+                document.getElementById('workoutHistoryList').innerHTML = '<li>Workout tracking is disabled (Firebase not configured).</li>';
+                renderCalendar(currentCalendarDate.getFullYear(), currentCalendarDate.getMonth()); // Render calendar even if no data
+            }
+
+            // Chart.js Initialization
+            const ctx = document.getElementById('macroChart').getContext('2d');
+            const proteinGrams = 110;
+            const carbGrams = 355;
+            const fatGrams = 70;
+
+            const proteinCals = proteinGrams * 4;
+            const carbCals = carbGrams * 4;
+            const fatCals = fatGrams * 9;
+
+            new Chart(ctx, {
+                type: 'doughnut',
+                data: {
+                    labels: ['Protein', 'Carbohydrates', 'Fats'],
+                    datasets: [{
+                        label: 'Caloric Distribution',
+                        data: [proteinCals, carbCals, fatCals],
+                        backgroundColor: [
+                            'rgba(0, 123, 122, 0.8)',   // Rich Teal
+                            'rgba(245, 158, 11, 0.8)',  // Amber
+                            'rgba(59, 130, 246, 0.8)'   // Blue
+                        ],
+                        borderColor: [
+                            '#F8F8F8'
+                        ],
+                        borderWidth: 4,
+                        hoverOffset: 4
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    cutout: '70%',
+                    plugins: {
+                        legend: {
+                            position: 'bottom',
+                            labels: {
+                                font: {
+                                    size: 14,
+                                    family: 'Inter'
+                                },
+                                padding: 20,
+                            }
+                        },
+                        tooltip: {
+                             callbacks: {
+                                label: function(context) {
+                                    let label = context.label || '';
+                                    if (label) {
+                                        label += ': ';
+                                    }
+                                    if (context.parsed !== null) {
+                                        let cals = context.parsed;
+                                        let grams = 0;
+                                        if (context.label === 'Protein') grams = proteinGrams;
+                                        if (context.label === 'Carbohydrates') grams = carbGrams;
+                                        if (context.label === 'Fats') grams = fatGrams;
+                                        label += `${cals.toFixed(0)} Calories (~${grams}g)`;
+                                    }
+                                    return label;
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+
+            // Gemini API Integration - Meal Idea Generator
+            const generateMealBtn = document.getElementById('generateMealBtn');
+            const mealTypeInput = document.getElementById('mealTypeInput');
+            const mealIdeaOutput = document.getElementById('mealIdeaOutput');
+            const mealIdeaLoader = document.getElementById('mealIdeaLoader');
+
+            generateMealBtn.addEventListener('click', async () => {
+                const mealType = mealTypeInput.value.trim();
+                const defaultText = "Your generated meal idea will appear here.";
+
+                if (!mealType && mealIdeaOutput.innerHTML === defaultText) {
+                    mealIdeaOutput.innerHTML = "Please enter a meal type (e.g., Breakfast, Lunch) or leave blank for a general idea.";
+                    return;
+                }
+                
+                mealIdeaOutput.innerHTML = ''; // Clear previous content
+                mealIdeaLoader.style.display = 'block'; // Show loader
+
+                const proteinTarget = '97-119g';
+                const carbTarget = '250-300g';
+                const fatTarget = '60-70g';
+                const totalCalories = '2490 calories';
+
+                const prompt = `Generate a healthy ${mealType ? mealType + ' ' : ''}meal idea for a 22-year-old male aiming for a lean athletic build. The meal should contribute towards a daily target of ${totalCalories}, with approximate macronutrient distribution of ${proteinTarget} protein, ${carbTarget} carbohydrates, and ${fatTarget} fats. Focus on whole, unprocessed foods. Structure the response clearly with ingredients and simple preparation steps.`;
+
+                try {
+                    let chatHistory = [];
+                    chatHistory.push({ role: "user", parts: [{ text: prompt }] });
+                    const payload = { contents: chatHistory };
+                    const apiKey = ""; 
+                    const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
+
+                    const response = await fetch(apiUrl, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload)
+                    });
+
+                    const result = await response.json();
+                    if (result.candidates && result.candidates.length > 0 &&
+                        result.candidates[0].content && result.candidates[0].content.parts &&
+                        result.candidates[0].content.parts.length > 0) {
+                        const text = result.candidates[0].content.parts[0].text;
+                        mealIdeaOutput.innerHTML = text.replace(/\n/g, '<br>'); // Display response, handle newlines
+                    } else {
+                        mealIdeaOutput.innerHTML = "Sorry, I couldn't generate a meal idea. Please try again or refine your request.";
+                    }
+                } catch (error) {
+                    console.error('Error calling Gemini API:', error);
+                    mealIdeaOutput.innerHTML = "An error occurred while generating the meal idea. Please try again.";
+                } finally {
+                    mealIdeaLoader.style.display = 'none'; // Hide loader
+                }
+            });
+
+            // Initial display for workout plan
+            showMonth('month1'); // Default to month 1
+            showWorkout('monday'); // Default to Monday
+        });
+    </script>
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #F8F8F8; /* Cleaner light gray */
+            color: #333333; /* Darker text for better contrast */
+        }
+        .active-tab {
+            border-bottom-color: #007B7A; /* Rich Teal */
+            color: #007B7A;
+            font-weight: 600;
+        }
+        .tab-btn {
+            border-bottom: 2px solid transparent;
+            transition: all 0.3s ease;
+        }
+        .tab-btn:hover {
+            color: #007B7A;
+        }
+        .content-section {
+            display: none;
+        }
+        .content-section.active {
+            display: block;
+        }
+        .month-selector.active, .workout-day-btn.active {
+            background-color: #007B7A; /* Rich Teal */
+            color: white;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        }
+        .month-selector, .workout-day-btn {
+            background-color: #E5E7EB; /* Light gray for inactive buttons */
+            color: #4B5563; /* Darker gray for inactive button text */
+            transition: all 0.2s ease-in-out;
+            border-radius: 9999px; /* Full rounded */
+        }
+        .month-selector:hover, .workout-day-btn:hover {
+            background-color: #D1D5DB; /* Slightly darker hover for inactive */
+            color: #1F2937;
+        }
+        .month-selector.active:hover, .workout-day-btn.active:hover {
+            background-color: #005C5B; /* Darker teal for active hover */
+        }
+        .chart-container { 
+            position: relative; 
+            width: 100%; 
+            max-width: 400px; 
+            margin-left: auto; 
+            margin-right: auto; 
+            height: 300px;
+            max-height: 400px;
+        }
+        @media (min-width: 768px) { 
+            .chart-container { 
+                height: 350px; 
+            } 
+        }
+        .loader {
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid #007B7A; /* Rich Teal */
+            border-radius: 50%;
+            width: 30px;
+            height: 30px;
+            animation: spin 1s linear infinite;
+            display: none;
+            margin: 0 auto;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        .bg-white {
+            background-color: #FFFFFF;
+        }
+        .shadow-md {
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+        }
+        .log-workout-btn {
+            background-color: #007B7A;
+        }
+        .log-workout-btn:hover:not(:disabled) {
+            background-color: #005C5B;
+        }
+        .log-workout-btn:disabled {
+            cursor: not-allowed;
+            opacity: 0.7;
+        }
+        /* Calendar specific styles */
+        .calendar-grid {
+            display: grid;
+            grid-template-columns: repeat(7, 1fr);
+            gap: 2px;
+            border: 1px solid #E5E7EB;
+            border-radius: 0.5rem;
+            overflow: hidden;
+            background-color: #F9FAFB;
+        }
+        .calendar-day-header {
+            background-color: #F3F4F6;
+            font-weight: 600;
+            color: #4B5563;
+            padding: 0.5rem;
+            text-align: center;
+            font-size: 0.875rem;
+        }
+        .calendar-grid > div {
+            border: 1px solid #F3F4F6;
+            min-height: 50px; /* Ensure sufficient height for days */
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            position: relative;
+            font-size: 0.95rem;
+            color: #6B7280;
+        }
+        .logged-day {
+            background-color: #D4E7E6; /* Light teal for logged days */
+            color: #007B7A; /* Darker teal text for logged days */
+            font-weight: bold;
+        }
+        .logged-day::after {
+            content: '✔️'; /* Checkmark for logged days */
+            position: absolute;
+            top: 4px;
+            right: 4px;
+            font-size: 0.75rem;
+            line-height: 1;
+        }
+    </style>
+</head>
+<body class="antialiased">
+
+    <div class="container mx-auto p-4 sm:p-6 lg:p-8 max-w-7xl">
+        <header class="text-center mb-8">
+            <h1 class="text-4xl font-bold text-gray-900">Your 2-Month Fitness Plan</h1>
+            <p class="text-lg text-gray-700 mt-2">Lean Mass & Athletic Build Program</p>
+        </header>
+
+        <nav class="flex justify-center border-b border-gray-300 mb-8">
+            <button class="tab-btn py-4 px-6 text-lg active-tab" onclick="showTab('dashboard')">Dashboard</button>
+            <button class="tab-btn py-4 px-6 text-lg" onclick="showTab('workout')">Workout Plan</button>
+            <button class="tab-btn py-4 px-6 text-lg" onclick="showTab('principles')">Principles</button>
+        </nav>
+
+        <main>
+            <section id="dashboard" class="content-section active">
+                <div class="text-center mb-8">
+                    <h2 class="text-3xl font-semibold text-gray-900">Daily Goals at a Glance</h2>
+                    <p class="text-md text-gray-700 mt-2">Here are the key numbers to focus on every day for consistent progress.</p>
+                </div>
+                <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-12">
+                    <div class="bg-white p-6 rounded-xl shadow-md text-center">
+                        <h3 class="text-lg font-semibold text-gray-500">Target Calories</h3>
+                        <p class="text-4xl font-bold text-[#007B7A] mt-2">2,490</p>
+                        <p class="text-sm text-gray-600 mt-1">per day</p>
+                    </div>
+                    <div class="bg-white p-6 rounded-xl shadow-md text-center">
+                        <h3 class="text-lg font-semibold text-gray-500">Protein</h3>
+                        <p class="text-4xl font-bold text-[#007B7A] mt-2">97-119g</p>
+                        <p class="text-sm text-gray-600 mt-1">for muscle growth</p>
+                    </div>
+                    <div class="bg-white p-6 rounded-xl shadow-md text-center">
+                        <h3 class="text-lg font-semibold text-gray-500">Carbohydrates</h3>
+                        <p class="text-4xl font-bold text-[#007B7A] mt-2">250-300g</p>
+                         <p class="text-sm text-gray-600 mt-1">for energy</p>
+                    </div>
+                    <div class="bg-white p-6 rounded-xl shadow-md text-center">
+                        <h3 class="text-lg font-semibold text-gray-500">Fats</h3>
+                        <p class="text-4xl font-bold text-[#007B7A] mt-2">60-70g</p>
+                        <p class="text-sm text-gray-600 mt-1">for health</p>
+                    </div>
+                </div>
+
+                <div class="grid grid-cols-1 lg:grid-cols-2 gap-8 items-center mb-12">
+                    <div class="bg-white p-6 rounded-xl shadow-md">
+                        <h3 class="text-2xl font-semibold text-gray-900 mb-4 text-center">Caloric Distribution</h3>
+                        <div class="chart-container">
+                            <canvas id="macroChart"></canvas>
+                        </div>
+                    </div>
+                    <div class="bg-white p-6 rounded-xl shadow-md">
+                        <h3 class="text-2xl font-semibold text-gray-900 mb-4">Fuel Your Growth</h3>
+                        <p class="text-gray-700 mb-4">Focus on these nutrient-dense food sources to hit your daily macro targets and provide your body with the high-quality fuel it needs to build muscle and recover effectively.</p>
+                        <div class="space-y-3">
+                            <div>
+                                <h4 class="font-bold text-lg">Protein Sources:</h4>
+                                <p class="text-gray-700">Chicken, lean beef, fish, eggs, dairy, whey protein.</p>
+                            </div>
+                            <div>
+                                <h4 class="font-bold text-lg">Carbohydrate Sources:</h4>
+                                <p class="text-gray-700">Rice, oats, whole-grain bread, sweet potatoes, fruits, vegetables.</p>
+                            </div>
+                            <div>
+                                <h4 class="font-bold text-lg">Fat Sources:</h4>
+                                <p class="text-gray-700">Avocados, nuts, seeds, olive oil, fatty fish.</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="bg-white p-6 rounded-xl shadow-md">
+                    <h3 class="text-2xl font-semibold text-gray-900 mb-4 text-center">✨ Meal Idea Generator ✨</h3>
+                    <p class="text-gray-700 mb-4 text-center">Get personalized meal suggestions tailored to your calorie and macro goals.</p>
+                    <div class="flex flex-col sm:flex-row items-center justify-center gap-4 mb-6">
+                        <input type="text" id="mealTypeInput" placeholder="e.g., Breakfast, Dinner, Snack" class="flex-grow w-full sm:w-auto p-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-[#007B7A]">
+                        <button id="generateMealBtn" class="bg-[#007B7A] text-white py-3 px-6 rounded-lg font-semibold hover:bg-[#005C5B] transition w-full sm:w-auto">
+                            Generate Meal Idea
+                        </button>
+                    </div>
+                    <div id="mealIdeaLoader" class="loader"></div>
+                    <div id="mealIdeaOutput" class="mt-6 p-4 bg-gray-50 rounded-lg border border-gray-200 min-h-[100px] flex items-center justify-center text-gray-700 italic">
+                        Your generated meal idea will appear here.
+                    </div>
+                </div>
+            </section>
+
+            <section id="workout" class="content-section">
+                <div class="text-center mb-8">
+                    <h2 class="text-3xl font-semibold text-gray-900">Your Training Program</h2>
+                    <p class="text-md text-gray-700 mt-2">Select a month and day to view your workout routine.</p>
+                </div>
+
+                <div class="flex justify-center flex-wrap gap-3 mb-8">
+                    <button class="month-selector active text-lg font-semibold py-2 px-6 rounded-full bg-gray-200 text-gray-700 transition" data-month="month1" onclick="showMonth('month1')">Month 1: Foundation</button>
+                    <button class="month-selector text-lg font-semibold py-2 px-6 rounded-full bg-gray-200 text-gray-700 transition" data-month="month2" onclick="showMonth('month2')">Month 2: Progression</button>
+                </div>
+
+                <div id="month1-plan" class="month-plan">
+                    <div class="flex justify-center flex-wrap gap-3 mb-8">
+                        <button class="workout-day-btn active text-lg font-semibold py-2 px-6 rounded-full bg-gray-200 text-gray-700 transition" data-day="monday" onclick="showWorkout('monday', 'month1')">Monday</button>
+                        <button class="workout-day-btn text-lg font-semibold py-2 px-6 rounded-full bg-gray-200 text-gray-700 transition" data-day="tuesday" onclick="showWorkout('tuesday', 'month1')">Tuesday</button>
+                        <button class="workout-day-btn text-lg font-semibold py-2 px-6 rounded-full bg-gray-200 text-gray-700 transition" data-day="thursday" onclick="showWorkout('thursday', 'month1')">Thursday</button>
+                        <button class="workout-day-btn text-lg font-semibold py-2 px-6 rounded-full bg-gray-200 text-gray-700 transition" data-day="friday" onclick="showWorkout('friday', 'month1')">Friday</button>
+                    </div>
+                    <div id="workout-details-month1">
+                        <div id="monday-workout-month1" class="workout-plan active">
+                            <div class="bg-white p-6 rounded-xl shadow-md">
+                                <h3 class="text-2xl font-bold mb-4 flex items-center"><span class="mr-3 text-3xl">🏋️‍♂️</span> Upper Body A</h3>
+                                <div class="space-y-4 divide-y divide-gray-100">
+                                    <p class="pt-4"><strong>🔥 Warm-up (10-15 mins):</strong> 5-7 mins light cardio, dynamic stretches, then 2 sets of 8-12 Push-Ups.</p>
+                                    <div><h4 class="font-semibold text-lg pt-4">💪 Workout (45-60 mins):</h4>
+                                    <ul class="list-disc list-inside mt-2 space-y-2 text-gray-700">
+                                        <li><strong>Barbell Bench Press:</strong> 3 sets x 8-12 reps</li>
+                                        <li><strong>Incline Barbell Bench Press:</strong> 3 sets x 10-12 reps</li>
+                                        <li><strong>Seated Chest Press Machine:</strong> 3 sets x 10-12 reps</li>
+                                        <li><strong>Lat Pulldown (Cable):</strong> 3 sets x 8-12 reps</li>
+                                        <li><strong>Single-Arm Dumbbell Row:</strong> 3 sets x 10-12 reps (each arm)</li>
+                                        <li><strong>Seated Machine Overhead Press:</strong> 3 sets x 8-12 reps</li>
+                                        <li><strong>Dumbbell Lateral Raises:</strong> 3 sets x 12-15 reps</li>
+                                        <li><strong>Barbell Bicep Curls:</strong> 3 sets x 10-12 reps</li>
+                                        <li><strong>Triceps Cable Pushdowns:</strong> 3 sets x 10-12 reps</li>
+                                    </ul></div>
+                                    <p class="pt-4"><strong>🧘 Cool-down (10-15 mins):</strong> 5-10 mins static stretching for upper body. Hold each stretch 20-30s.</p>
+                                </div>
+                                <button class="log-workout-btn bg-[#007B7A] text-white py-3 px-6 rounded-lg font-semibold transition mt-6 w-full" data-workout-day-id="monday-workout-month1" data-month-plan="month1" onclick="logWorkout(this)">Mark as Complete</button>
+                            </div>
+                        </div>
+                        <div id="tuesday-workout-month1" class="workout-plan" style="display:none;">
+                            <div class="bg-white p-6 rounded-xl shadow-md">
+                                <h3 class="text-2xl font-bold mb-4 flex items-center"><span class="mr-3 text-3xl">🦵</span> Lower Body A + Abs</h3>
+                                <div class="space-y-4 divide-y divide-gray-100">
+                                    <p class="pt-4"><strong>🔥 Warm-up (10-15 mins):</strong> 5-7 mins light cardio, dynamic stretches, then 2 sets of 10-15 Bodyweight Squats.</p>
+                                    <div><h4 class="font-semibold text-lg pt-4">💪 Workout (45-60 mins):</h4>
+                                    <ul class="list-disc list-inside mt-2 space-y-2 text-gray-700">
+                                        <li><strong>Squats:</strong> 4 sets x 8-12 reps (Focus on form!)</li>
+                                        <li><strong>Leg Press (45° Machine):</strong> 3 sets x 10-12 reps</li>
+                                        <li><strong>Lying Leg Curl Machine:</strong> 3 sets x 10-12 reps</li>
+                                        <li><strong>Seated Calf Raise Machine:</strong> 3 sets x 15-20 reps</li>
+                                        <li><strong>Hanging Leg Raises / Weighted Crunches:</strong> 3 sets x 15-20 reps</li>
+                                        <li><strong>Plank:</strong> 3 sets x 45-60 second hold</li>
+                                    </ul></div>
+                                    <p class="pt-4"><strong>🧘 Cool-down (10-15 mins):</strong> 5-10 mins static stretching for lower body and core.</p>
+                                </div>
+                                <button class="log-workout-btn bg-[#007B7A] text-white py-3 px-6 rounded-lg font-semibold transition mt-6 w-full" data-workout-day-id="tuesday-workout-month1" data-month-plan="month1" onclick="logWorkout(this)">Mark as Complete</button>
+                            </div>
+                        </div>
+                        <div id="thursday-workout-month1" class="workout-plan" style="display:none;">
+                            <div class="bg-white p-6 rounded-xl shadow-md">
+                                <h3 class="text-2xl font-bold mb-4 flex items-center"><span class="mr-3 text-3xl">🏋️‍♂️</span> Upper Body B</h3>
+                                <div class="space-y-4 divide-y divide-gray-100">
+                                    <p class="pt-4"><strong>🔥 Warm-up (10-15 mins):</strong> 5-7 mins light cardio, dynamic stretches, then 2 sets of max reps Pull-Ups (or assisted).</p>
+                                    <div><h4 class="font-semibold text-lg pt-4">💪 Workout (45-60 mins):</h4>
+                                    <ul class="list-disc list-inside mt-2 space-y-2 text-gray-700">
+                                        <li><strong>Seated Row (Cable):</strong> 3 sets x 10-12 reps</li>
+                                        <li><strong>Reverse Grip Lat Pulldown:</strong> 3 sets x 10-12 reps</li>
+                                        <li><strong>Seated Row Machine:</strong> 3 sets x 10-12 reps</li>
+                                        <li><strong>Dumbbell Pullover:</strong> 3 sets x 10-12 reps</li>
+                                        <li><strong>Seated Chest Fly Machine:</strong> 3 sets x 12-15 reps</li>
+                                        <li><strong>Dumbbell Front Raises:</strong> 3 sets x 10-12 reps</li>
+                                        <li><strong>Seated Reverse Fly Machine:</strong> 3 sets x 12-15 reps</li>
+                                        <li><strong>Overhead Triceps Extension:</strong> 3 sets x 10-12 reps</li>
+                                        <li><strong>Dumbbell Bicep Curls:</strong> 3 sets x 10-12 reps</li>
+                                    </ul></div>
+                                    <p class="pt-4"><strong>🧘 Cool-down (10-15 mins):</strong> 5-10 mins static stretching for upper body.</p>
+                                </div>
+                                <button class="log-workout-btn bg-[#007B7A] text-white py-3 px-6 rounded-lg font-semibold transition mt-6 w-full" data-workout-day-id="thursday-workout-month1" data-month-plan="month1" onclick="logWorkout(this)">Mark as Complete</button>
+                            </div>
+                        </div>
+                        <div id="friday-workout-month1" class="workout-plan" style="display:none;">
+                            <div class="bg-white p-6 rounded-xl shadow-md">
+                                <h3 class="text-2xl font-bold mb-4 flex items-center"><span class="mr-3 text-3xl">🦵</span> Lower Body B + Abs</h3>
+                                <div class="space-y-4 divide-y divide-gray-100">
+                                    <p class="pt-4"><strong>🔥 Warm-up (10-15 mins):</strong> 5-7 mins light cardio, dynamic stretches, then 2 sets of 12-15 light Leg Extensions.</p>
+                                    <div><h4 class="font-semibold text-lg pt-4">💪 Workout (45-60 mins):</h4>
+                                    <ul class="list-disc list-inside mt-2 space-y-2 text-gray-700">
+                                        <li><strong>Leg Extension Machine:</strong> 3 sets x 10-12 reps</li>
+                                        <li><strong>Leg Press (45° Machine):</strong> 3 sets x 10-12 reps</li>
+                                        <li><strong>Romanian Deadlifts (Dumbbell/Barbell):</strong> 3 sets x 8-12 reps</li>
+                                        <li><strong>Standing Calf Raises:</strong> 3 sets x 15-20 reps</li>
+                                        <li><strong>Weighted Crunches / Cable Crunches:</strong> 3 sets x 15-20 reps</li>
+                                        <li><strong>Lying Leg Raises:</strong> 3 sets x 15-20 reps</li>
+                                        <li><strong>Farmer's Walk:</strong> 3 sets x 30 seconds</li>
+                                        <li><strong>Plate Pinches:</strong> 3 sets x 30 seconds</li>
+                                    </ul></div>
+                                    <p class="pt-4"><strong>🧘 Cool-down (10-15 mins):</strong> 5-10 mins static stretching for lower body, abs, and forearms.</p>
+                                </div>
+                                <button class="log-workout-btn bg-[#007B7A] text-white py-3 px-6 rounded-lg font-semibold transition mt-6 w-full" data-workout-day-id="friday-workout-month1" data-month-plan="month1" onclick="logWorkout(this)">Mark as Complete</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div id="month2-plan" class="month-plan" style="display:none;">
+                    <div class="flex justify-center flex-wrap gap-3 mb-8">
+                        <button class="workout-day-btn active text-lg font-semibold py-2 px-6 rounded-full bg-gray-200 text-gray-700 transition" data-day="monday" onclick="showWorkout('monday', 'month2')">Monday</button>
+                        <button class="workout-day-btn text-lg font-semibold py-2 px-6 rounded-full bg-gray-200 text-gray-700 transition" data-day="tuesday" onclick="showWorkout('tuesday', 'month2')">Tuesday</button>
+                        <button class="workout-day-btn text-lg font-semibold py-2 px-6 rounded-full bg-gray-200 text-gray-700 transition" data-day="thursday" onclick="showWorkout('thursday', 'month2')">Thursday</button>
+                        <button class="workout-day-btn text-lg font-semibold py-2 px-6 rounded-full bg-gray-200 text-gray-700 transition" data-day="friday" onclick="showWorkout('friday', 'month2')">Friday</button>
+                    </div>
+                    <div id="workout-details-month2">
+                        <div id="monday-workout-month2" class="workout-plan active">
+                            <div class="bg-white p-6 rounded-xl shadow-md">
+                                <h3 class="text-2xl font-bold mb-4 flex items-center"><span class="mr-3 text-3xl">💪</span> Chest + Triceps</h3>
+                                <div class="space-y-4 divide-y divide-gray-100">
+                                    <p class="pt-4"><strong>🔥 Warm-up (10-15 mins):</strong> 5-7 mins light cardio, dynamic stretches, then 2 sets of 8-12 Push-Ups.</p>
+                                    <div><h4 class="font-semibold text-lg pt-4">💪 Workout (45-60 mins):</h4>
+                                    <ul class="list-disc list-inside mt-2 space-y-2 text-gray-700">
+                                        <li><strong>Barbell Bench Press:</strong> 3 sets x 6-10 reps (Heavier)</li>
+                                        <li><strong>Incline Dumbbell Press:</strong> 3 sets x 8-12 reps</li>
+                                        <li><strong>Cable Crossover (High-to-Low):</strong> 3 sets x 12-15 reps</li>
+                                        <li><strong>Triceps Dips (Machine):</strong> 3 sets x 10-12 reps</li>
+                                        <li><strong>Overhead Triceps Extension (Dumbbell):</strong> 3 sets x 10-12 reps</li>
+                                        <li><strong>Triceps Pushdown (V-Bar):</strong> 3 sets x 10-12 reps</li>
+                                    </ul></div>
+                                    <p class="pt-4"><strong>🧘 Cool-down (10-15 mins):</strong> 5-10 mins static stretching for chest and triceps.</p>
+                                </div>
+                                <button class="log-workout-btn bg-[#007B7A] text-white py-3 px-6 rounded-lg font-semibold transition mt-6 w-full" data-workout-day-id="monday-workout-month2" data-month-plan="month2" onclick="logWorkout(this)">Mark as Complete</button>
+                            </div>
+                        </div>
+                        <div id="tuesday-workout-month2" class="workout-plan" style="display:none;">
+                            <div class="bg-white p-6 rounded-xl shadow-md">
+                                <h3 class="text-2xl font-bold mb-4 flex items-center"><span class="mr-3 text-3xl">💪</span> Back + Biceps</h3>
+                                <div class="space-y-4 divide-y divide-gray-100">
+                                    <p class="pt-4"><strong>🔥 Warm-up (10-15 mins):</strong> 5-7 mins light cardio, dynamic stretches, then 2 sets of max reps Pull-Ups.</p>
+                                    <div><h4 class="font-semibold text-lg pt-4">💪 Workout (45-60 mins):</h4>
+                                    <ul class="list-disc list-inside mt-2 space-y-2 text-gray-700">
+                                        <li><strong>Deadlifts (Conventional or Sumo, focus on form):</strong> 3 sets x 5-8 reps</li>
+                                        <li><strong>Lat Pulldown (Cable):</strong> 3 sets x 8-12 reps</li>
+                                        <li><strong>Seated Row (Cable):</strong> 3 sets x 8-12 reps</li>
+                                        <li><strong>Dumbbell Bicep Curls:</strong> 3 sets x 10-12 reps</li>
+                                        <li><strong>Hammer Curls (Dumbbell):</strong> 3 sets x 10-12 reps</li>
+                                        <li><strong>Preacher Curls (EZ Bar):</strong> 3 sets x 10-12 reps</li>
+                                    </ul></div>
+                                    <p class="pt-4"><strong>🧘 Cool-down (10-15 mins):</strong> 5-10 mins static stretching for back and biceps.</p>
+                                </div>
+                                <button class="log-workout-btn bg-[#007B7A] text-white py-3 px-6 rounded-lg font-semibold transition mt-6 w-full" data-workout-day-id="tuesday-workout-month2" data-month-plan="month2" onclick="logWorkout(this)">Mark as Complete</button>
+                            </div>
+                        </div>
+                        <div id="thursday-workout-month2" class="workout-plan" style="display:none;">
+                            <div class="bg-white p-6 rounded-xl shadow-md">
+                                <h3 class="text-2xl font-bold mb-4 flex items-center"><span class="mr-3 text-3xl">🏋️‍♂️</span> Shoulders + Abs</h3>
+                                <div class="space-y-4 divide-y divide-gray-100">
+                                    <p class="pt-4"><strong>🔥 Warm-up (10-15 mins):</strong> 5-7 mins light cardio, dynamic stretches.</p>
+                                    <div><h4 class="font-semibold text-lg pt-4">💪 Workout (45-60 mins):</h4>
+                                    <ul class="list-disc list-inside mt-2 space-y-2 text-gray-700">
+                                        <li><strong>Barbell Overhead Press (Standing or Seated):</strong> 3 sets x 6-10 reps</li>
+                                        <li><strong>Dumbbell Lateral Raises:</strong> 3 sets x 12-15 reps</li>
+                                        <li><strong>Face Pulls (Cable):</strong> 3 sets x 15-20 reps</li>
+                                        <li><strong>Dumbbell Shrugs:</strong> 3 sets x 12-15 reps</li>
+                                        <li><strong>Weighted Cable Crunches:</strong> 3 sets x 15-20 reps</li>
+                                        <li><strong>Russian Twists (Weighted):</strong> 3 sets x 15-20 reps (each side)</li>
+                                    </ul></div>
+                                    <p class="pt-4"><strong>🧘 Cool-down (10-15 mins):</strong> 5-10 mins static stretching for shoulders and abs.</p>
+                                </div>
+                                <button class="log-workout-btn bg-[#007B7A] text-white py-3 px-6 rounded-lg font-semibold transition mt-6 w-full" data-workout-day-id="thursday-workout-month2" data-month-plan="month2" onclick="logWorkout(this)">Mark as Complete</button>
+                            </div>
+                        </div>
+                        <div id="friday-workout-month2" class="workout-plan" style="display:none;">
+                            <div class="bg-white p-6 rounded-xl shadow-md">
+                                <h3 class="text-2xl font-bold mb-4 flex items-center"><span class="mr-3 text-3xl">🦵</span> Legs + Calves</h3>
+                                <div class="space-y-4 divide-y divide-gray-100">
+                                    <p class="pt-4"><strong>🔥 Warm-up (10-15 mins):</strong> 5-7 mins light cardio, dynamic stretches, bodyweight squats.</p>
+                                    <div><h4 class="font-semibold text-lg pt-4">💪 Workout (45-60 mins):</h4>
+                                    <ul class="list-disc list-inside mt-2 space-y-2 text-gray-700">
+                                        <li><strong>Squats:</strong> 4 sets x 6-10 reps (Heavier)</li>
+                                        <li><strong>Leg Press:</strong> 3 sets x 8-12 reps</li>
+                                        <li><strong>Leg Extension Machine:</strong> 3 sets x 10-15 reps</li>
+                                        <li><strong>Hamstring Curls (Seated or Lying):</strong> 3 sets x 10-15 reps</li>
+                                        <li><strong>Standing Calf Raises (Machine):</strong> 3 sets x 15-20 reps</li>
+                                        <li><strong>Seated Calf Raises (Machine):</strong> 3 sets x 15-20 reps</li>
+                                    </ul></div>
+                                    <p class="pt-4"><strong>🧘 Cool-down (10-15 mins):</strong> 5-10 mins static stretching for legs and calves.</p>
+                                </div>
+                                <button class="log-workout-btn bg-[#007B7A] text-white py-3 px-6 rounded-lg font-semibold transition mt-6 w-full" data-workout-day-id="friday-workout-month2" data-month-plan="month2" onclick="logWorkout(this)">Mark as Complete</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+            
+            <section id="principles" class="content-section">
+                <div class="text-center mb-8">
+                    <h2 class="text-3xl font-semibold text-gray-900">Your Keys to Success</h2>
+                    <p class="text-md text-gray-700 mt-2">Building an athletic physique is a marathon, not a sprint. Internalize these principles to ensure long-term, sustainable success.</p>
+                </div>
+                <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6 mb-12">
+                    <div class="bg-white p-6 rounded-xl shadow-md">
+                        <h3 class="font-bold text-xl mb-2">1. Progressive Overload</h3>
+                        <p class="text-gray-700">The most critical rule. Each week, aim to increase weight, reps, or sets. This forces your muscles to adapt and grow. Track everything in a log.</p>
+                    </div>
+                    <div class="bg-white p-6 rounded-xl shadow-md">
+                        <h3 class="font-bold text-xl mb-2">2. Master Your Form</h3>
+                        <p class="text-gray-700">Perfect form is more important than heavy weight, especially now. Proper technique prevents injury and maximizes muscle activation. </p>
+                    </div>
+                    <div class="bg-white p-6 rounded-xl shadow-md">
+                        <h3 class="font-bold text-xl mb-2">3. Hydration is Crucial</h3>
+                        <p class="text-gray-700">Drink 3-4 liters of water daily. Proper hydration is vital for performance, recovery, and transporting nutrients to your muscles.</p>
+                    </div>
+                    <div class="bg-white p-6 rounded-xl shadow-md">
+                        <h3 class="font-bold text-xl mb-2">4. Prioritize Sleep</h3>
+                        <p class="text-gray-700">Aim for 7-9 hours of quality sleep per night. Your muscles don't grow in the gym; they grow and repair while you rest.</p>
+                    </div>
+                     <div class="bg-white p-6 rounded-xl shadow-md">
+                        <h3 class="font-bold text-xl mb-2">5. Unwavering Consistency</h3>
+                        <p class="text-gray-700">Adhere to your plan daily. Results come from the cumulative effect of consistent workouts and nutrition, even on days you lack motivation.</p>
+                    </div>
+                    <div class="bg-white p-6 rounded-xl shadow-md">
+                        <h3 class="font-bold text-xl mb-2">6. Listen To Your Body</h3>
+                        <p class="text-gray-700">Learn the difference between muscle soreness (good) and joint pain (bad). If something hurts sharply, stop. Don't be afraid to take an extra rest day.</p>
+                    </div>
+                </div>
+
+                <div class="bg-white p-6 rounded-xl shadow-md mt-8">
+                    <h3 class="text-2xl font-semibold text-gray-900 mb-4 text-center">📅 Workout Calendar</h3>
+                    <div class="flex justify-between items-center mb-4">
+                        <button class="bg-gray-200 hover:bg-gray-300 text-gray-700 py-1 px-3 rounded-full transition" onclick="changeMonth(-1)">&#9664; Prev</button>
+                        <span id="currentMonthDisplay" class="text-xl font-bold text-gray-900"></span>
+                        <button class="bg-gray-200 hover:bg-gray-300 text-gray-700 py-1 px-3 rounded-full transition" onclick="changeMonth(1)">Next &#9654;</button>
+                    </div>
+                    <div class="calendar-grid mb-6">
+                        <div class="calendar-day-header">Mon</div>
+                        <div class="calendar-day-header">Tue</div>
+                        <div class="calendar-day-header">Wed</div>
+                        <div class="calendar-day-header">Thu</div>
+                        <div class="calendar-day-header">Fri</div>
+                        <div class="calendar-day-header">Sat</div>
+                        <div class="calendar-day-header">Sun</div>
+                        <div id="calendarDays">
+                            <!-- Calendar days will be populated by JavaScript -->
+                        </div>
+                    </div>
+                </div>
+
+                <div class="bg-white p-6 rounded-xl shadow-md mt-8">
+                    <h3 class="text-2xl font-semibold text-gray-900 mb-4 text-center">📊 Your Workout History</h3>
+                    <p class="text-gray-700 mb-4 text-center">Track your consistency and celebrate your progress!</p>
+                    <div class="text-center mb-4">
+                        <p class="text-lg font-semibold">Total Workout Days Logged: <span id="totalWorkoutsCount" class="text-[#007B7A] text-2xl">0</span></p>
+                    </div>
+                    <ul id="workoutHistoryList" class="list-none p-0 max-h-80 overflow-y-auto border border-gray-200 rounded-lg bg-gray-50">
+                        <!-- Workout history will be loaded here by JavaScript -->
+                    </ul>
+                </div>
+            </section>
+        </main>
+    </div>
+</body>
+</html>
