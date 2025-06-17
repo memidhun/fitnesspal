@@ -19,7 +19,7 @@ Built for simplicity, speed, and real results.
 ## 🌐 Try It Live
 
 > **Hosted with ❤️ on GitHub Pages:**  
-> [fitnesspal Live Demo](https://your-github-username.github.io/fitnesspal/)
+> [fitnesspal Live Demo](https://memidhun.github.io/fitnesspal/)
 
 ---
 
